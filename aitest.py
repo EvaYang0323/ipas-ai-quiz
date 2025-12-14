@@ -1,248 +1,297 @@
 import json
 import random
 import sqlite3
-from pathlib import Path
 import streamlit as st
+from pathlib import Path
 
+# --- 設定路徑 ---
 APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "quiz.db"
 QUESTIONS_PATH = APP_DIR / "questions.json"
 
 
 # -------------------------
-# DB helpers
+# 資料庫功能 (Database)
 # -------------------------
-def db():
+def init_db():
+    """初始化資料庫"""
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS attempts (
-            qid TEXT PRIMARY KEY,
-            is_correct INTEGER NOT NULL,
-            last_answer TEXT,
-            correct_answer TEXT
-        )
-    """)
-    return conn
+    c = conn.cursor()
+    c.execute("""
+              CREATE TABLE IF NOT EXISTS attempts
+              (
+                  qid
+                  TEXT
+                  PRIMARY
+                  KEY,
+                  is_correct
+                  INTEGER
+                  NOT
+                  NULL,
+                  last_answer
+                  TEXT,
+                  correct_answer
+                  TEXT
+              )
+              """)
+    conn.commit()
+    conn.close()
 
 
 def load_attempts():
-    conn = db()
+    """讀取所有作答紀錄"""
+    init_db()  # 確保表格存在
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.execute("SELECT qid, is_correct, last_answer, correct_answer FROM attempts")
     rows = cur.fetchall()
     conn.close()
+    # 回傳格式: {qid: {info...}}
     return {r[0]: {"is_correct": r[1], "last_answer": r[2], "correct_answer": r[3]} for r in rows}
 
 
-def upsert_attempt(qid: str, is_correct: bool, last_answer: str, correct_answer: str):
-    conn = db()
-    conn.execute(
-        "INSERT INTO attempts(qid, is_correct, last_answer, correct_answer) VALUES(?,?,?,?) "
-        "ON CONFLICT(qid) DO UPDATE SET is_correct=excluded.is_correct, last_answer=excluded.last_answer, correct_answer=excluded.correct_answer",
-        (qid, int(is_correct), last_answer, correct_answer),
-    )
+def save_attempts_batch(results):
+    """
+    批次寫入作答紀錄 (優化效能)
+    results: list of tuples (qid, is_correct, user_ans, correct_ans)
+    """
+    conn = sqlite3.connect(DB_PATH)
+    # 使用 UPSERT 語法 (SQLite 3.24+)
+    conn.executemany("""
+                     INSERT INTO attempts(qid, is_correct, last_answer, correct_answer)
+                     VALUES (?, ?, ?, ?) ON CONFLICT(qid) DO
+                     UPDATE SET
+                         is_correct=excluded.is_correct,
+                         last_answer=excluded.last_answer,
+                         correct_answer=excluded.correct_answer
+                     """, [(r["qid"], int(r["is_correct"]), r["user_ans"], r["correct_ans"]) for r in results])
     conn.commit()
     conn.close()
 
 
 def reset_progress():
-    conn = db()
+    """清空資料庫"""
+    conn = sqlite3.connect(DB_PATH)
     conn.execute("DELETE FROM attempts")
     conn.commit()
     conn.close()
 
 
 # -------------------------
-# Question loading (✅ adapted to your JSON schema)
+# 題目載入 (含快取優化)
 # -------------------------
+@st.cache_data  # <--- 關鍵優化：避免每次重整都讀檔
 def load_questions():
-    """
-    Your questions.json schema:
-      - id: int
-      - question: str
-      - options: list[str]
-      - answer: int (0-based index)
-      - explain: str (optional)
-    We normalize to internal schema used by the app:
-      - id: "Q0001"
-      - question: str
-      - choices: list[str]
-      - answer: str (correct choice text)
-      - explanation: str
-    """
     if not QUESTIONS_PATH.exists():
-        st.error("找不到 questions.json。請把題庫檔案放在 app.py 同一層。")
-        st.stop()
+        st.error(f"找不到檔案：{QUESTIONS_PATH}。請確認 questions.json 位於同一目錄。")
+        return []
 
     with open(QUESTIONS_PATH, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError:
+            st.error("JSON 格式錯誤，無法解析。")
+            return []
 
     if not isinstance(data, list) or len(data) == 0:
-        st.error("questions.json 必須是一個非空的 list。")
-        st.stop()
+        st.error("JSON 必須是一個非空的列表 (List)。")
+        return []
 
     normalized = []
     seen_ids = set()
 
     for i, q in enumerate(data):
-        # required keys
-        for k in ["id", "question", "options", "answer"]:
-            if k not in q:
-                st.error(f"第 {i+1} 題缺少欄位：{k}")
-                st.stop()
+        # 基本欄位檢查
+        required_keys = ["id", "question", "options", "answer"]
+        if not all(k in q for k in required_keys):
+            st.warning(f"第 {i + 1} 題資料不完整，跳過。")
+            continue
 
-        # validate id
-        try:
-            raw_id = int(q["id"])
-        except Exception:
-            st.error(f"第 {i+1} 題 id 需為整數（或可轉整數）。目前：{q['id']}")
-            st.stop()
-
+        raw_id = int(q["id"])
         if raw_id in seen_ids:
-            st.error(f"題庫中 id 重複：{raw_id}（請修正，否則不重複抽題會壞掉）")
-            st.stop()
+            continue  # 跳過重複 ID
         seen_ids.add(raw_id)
 
-        # validate question
-        question = q["question"]
-        if not isinstance(question, str) or not question.strip():
-            st.error(f"題目 {raw_id} 的 question 必須是非空字串。")
-            st.stop()
-
-        # validate options
         options = q["options"]
-        if not isinstance(options, list) or len(options) < 2 or not all(isinstance(x, str) for x in options):
-            st.error(f"題目 {raw_id} 的 options 必須是至少 2 個選項的字串 list。")
-            st.stop()
-
-        # validate answer index
         ans_idx = q["answer"]
-        if not isinstance(ans_idx, int) or not (0 <= ans_idx < len(options)):
-            st.error(f"題目 {raw_id} 的 answer 必須是 0~{len(options)-1} 的整數索引。")
-            st.stop()
+
+        # 確保選項有效性
+        if not isinstance(options, list) or len(options) < 2:
+            continue
+        if not (0 <= ans_idx < len(options)):
+            continue
 
         normalized.append({
-            "id": f"Q{raw_id:04d}",
-            "question": question.strip(),
-            "choices": [x.strip() for x in options],
-            "answer": options[ans_idx].strip(),
-            "explanation": (q.get("explain", "") or "").strip(),
+            "id": f"Q{raw_id:04d}",  # 格式化 ID 為 Q0001
+            "question": q["question"].strip(),
+            "choices": [str(x).strip() for x in options],
+            "answer": str(options[ans_idx]).strip(),  # 儲存正確答案的文字
+            "explanation": q.get("explanation", "").strip()
         })
 
     return normalized
 
 
 # -------------------------
-# Quiz logic
+# 抽題邏輯
 # -------------------------
 def pick_questions(all_questions, attempts, n, avoid_seen=True, use_wrong_only=False):
     seen_ids = set(attempts.keys())
+    # 錯題定義：在資料庫中且 is_correct 為 0
     wrong_ids = {qid for qid, v in attempts.items() if v["is_correct"] == 0}
 
+    pool = []
     if use_wrong_only:
+        # 只從錯題本挑
         pool = [q for q in all_questions if q["id"] in wrong_ids]
+        if not pool:
+            st.toast("太棒了！錯題本目前是空的 🎉")
     elif avoid_seen:
+        # 排除已做過的
         pool = [q for q in all_questions if q["id"] not in seen_ids]
+        if not pool:
+            st.toast("所有題目都做完囉！可以考慮重置進度。")
     else:
+        # 全部混抽
         pool = list(all_questions)
 
-    if len(pool) == 0:
+    if not pool:
         return []
 
+    # 取樣數量不超過池子大小
     n = min(int(n), len(pool))
     return random.sample(pool, n)
 
 
 # -------------------------
-# UI
+# 主程式 (Streamlit UI)
 # -------------------------
-st.set_page_config(page_title="iPAS AI 應用規劃師 初級｜複習頁", layout="wide")
-st.title("iPAS AI 應用規劃師（初級）複習頁 🧠✨")
-st.caption("隨機抽題｜錯題本｜已作答不重複（可重置）｜本機保存 SQLite")
+st.set_page_config(page_title="刷題神器", layout="centered")
 
+# 初始化 Session State
+if "picked" not in st.session_state:
+    st.session_state["picked"] = []
+if "submitted" not in st.session_state:
+    st.session_state["submitted"] = False
+if "user_answers" not in st.session_state:
+    st.session_state["user_answers"] = {}
+
+st.title("🔥 考試刷題神器")
+st.caption("隨機抽題 ｜ 錯題本 ｜ 自動記錄進度")
+
+# 1. 載入資料
 questions = load_questions()
+if not questions:
+    st.stop()  # 沒題目就停止
+
 attempts = load_attempts()
+total_q = len(questions)
+done_q = len(attempts)
+correct_q = sum(1 for v in attempts.values() if v["is_correct"] == 1)
+accuracy = (correct_q / done_q * 100) if done_q > 0 else 0.0
 
+# Sidebar 設定與統計
 with st.sidebar:
-    st.header("設定")
-    total = len(questions)
-    st.write(f"題庫總題數：**{total}**")
+    st.header("📊 刷題狀態")
+    st.write(f"總題庫：{total_q} 題")
+    st.write(f"已完成：{done_q} 題")
+    st.write(f"正確率：{accuracy:.1f}%")
+    st.progress(min(done_q / total_q, 1.0))
 
-    default_n = 50 if total >= 50 else total
-    n = st.number_input("本次抽題數", min_value=1, max_value=max(1, total), value=default_n, step=1)
+    st.divider()
+    st.header("⚙️ 抽題設定")
+    n_input = st.number_input("本次題數", 1, 100, 10)
+    avoid_seen = st.checkbox("只出「沒做過」的題", value=True)
+    wrong_only = st.checkbox("只出「錯題本」的題", value=False)
 
-    avoid_seen = st.toggle("已作答題目不再出現", value=True)
-    wrong_only = st.toggle("只練錯題本", value=False)
+    if st.button("🚀 開始/重新抽題", use_container_width=True):
+        picked = pick_questions(questions, attempts, n_input, avoid_seen, wrong_only)
+        st.session_state["picked"] = picked
+        st.session_state["submitted"] = False
+        st.session_state["user_answers"] = {}  # 重置答案
+        st.rerun()
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("開始新測驗", use_container_width=True):
-            picked = pick_questions(questions, attempts, int(n), avoid_seen=avoid_seen, use_wrong_only=wrong_only)
-            st.session_state["picked"] = picked
-            st.session_state["answers"] = {}
-            st.session_state["submitted"] = False
+    st.divider()
+    if st.button("🗑️ 重置所有進度", type="primary"):
+        reset_progress()
+        st.cache_data.clear()
+        st.session_state.clear()
+        st.rerun()
 
-    with col2:
-        if st.button("重置進度（清空已作答）", type="secondary", use_container_width=True):
-            reset_progress()
-            st.session_state.clear()
-            st.success("已清空進度。")
+# 2. 顯示題目區域
+picked_qs = st.session_state["picked"]
 
-picked = st.session_state.get("picked", [])
-
-if not picked:
-    st.info("按左側「開始新測驗」。如果你勾了「不重複」又做完了抽不到題，這代表你已經把題庫榨乾了（可重置）。")
+if not picked_qs:
+    st.info("👈 請在左側點擊「開始抽題」")
     st.stop()
 
-st.subheader(f"本次題目：{len(picked)} 題")
+# 使用 Form 避免每次點選 Radio 就重整頁面
+with st.form("quiz_form"):
+    st.subheader(f"本次練習：{len(picked_qs)} 題")
 
-# Render questions
-for idx, q in enumerate(picked, start=1):
-    st.markdown(f"### {idx}. {q['question']}")
-    qid = q["id"]
+    # 顯示每一題
+    for i, q in enumerate(picked_qs):
+        st.markdown(f"**{i + 1}. {q['question']}**")
+        qid = q["id"]
 
-    # set default
-    st.session_state.setdefault("answers", {})
-    st.session_state["answers"].setdefault(qid, q["choices"][0])
+        # 產生選項
+        # 注意：key 必須唯一，我們用 qid 綁定
+        st.radio(
+            "請選擇：",
+            q["choices"],
+            key=f"ans_{qid}",
+            index=None,  # 預設不選
+            label_visibility="collapsed"
+        )
+        st.markdown("---")
 
-    st.session_state["answers"][qid] = st.radio(
-        "選擇答案",
-        options=q["choices"],
-        index=q["choices"].index(st.session_state["answers"][qid]) if st.session_state["answers"][qid] in q["choices"] else 0,
-        key=f"radio_{qid}",
-        label_visibility="collapsed",
-    )
+    submitted = st.form_submit_button("📝 交卷", use_container_width=True)
 
-st.divider()
-
-if st.button("交卷並存檔", type="primary", use_container_width=True):
-    correct = 0
+# 3. 處理交卷邏輯
+if submitted:
+    results_to_save = []
+    score = 0
     wrong_list = []
 
-    for q in picked:
+    for q in picked_qs:
         qid = q["id"]
-        user_ans = st.session_state["answers"].get(qid)
-        is_correct = (user_ans == q["answer"])
-        upsert_attempt(qid, is_correct, user_ans, q["answer"])
+        user_ans = st.session_state.get(f"ans_{qid}")
+        correct_ans = q["answer"]
 
+        is_correct = (user_ans == correct_ans)
         if is_correct:
-            correct += 1
+            score += 1
         else:
-            wrong_list.append((q, user_ans))
+            wrong_list.append({
+                "q": q,
+                "user_ans": user_ans
+            })
 
+        results_to_save.append({
+            "qid": qid,
+            "is_correct": is_correct,
+            "user_ans": user_ans,
+            "correct_ans": correct_ans
+        })
+
+    # 存入資料庫
+    save_attempts_batch(results_to_save)
     st.session_state["submitted"] = True
-    score = round(correct / len(picked) * 100, 1)
-    st.success(f"得分：{correct}/{len(picked)}（{score} 分）")
 
-    if wrong_list:
-        st.warning(f"錯題：{len(wrong_list)} 題（已自動加入錯題本）")
-        with st.expander("查看錯題（含解析，如果題庫有提供 explain）", expanded=False):
-            for q, user_ans in wrong_list:
-                st.markdown(f"**{q['id']}**：{q['question']}")
-                st.write(f"你的答案：❌ {user_ans}")
-                st.write(f"正確答案：✅ {q['answer']}")
-                if q.get("explanation"):
-                    st.write(f"解析：{q['explanation']}")
-                st.divider()
-    else:
+    # 顯示結果
+    final_score = int(score / len(picked_qs) * 100)
+    if final_score == 100:
         st.balloons()
-        st.info("零錯題。錯題本表示：我今天可以下班了嗎？")
+        st.success(f"太強了！全對！得分：{final_score}")
+    else:
+        st.error(f"作答結束！得分：{final_score} (對 {score}/{len(picked_qs)} 題)")
+
+    # 顯示錯題解析
+    if wrong_list:
+        st.subheader("❌ 錯題檢討")
+        for item in wrong_list:
+            q = item['q']
+            with st.expander(f"題目：{q['question']}", expanded=True):
+                st.error(f"你的答案：{item['user_ans']}")
+                st.success(f"正確答案：{q['answer']}")
+                if q['explanation']:
+                    st.info(f"💡 解析：{q['explanation']}")
